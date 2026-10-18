@@ -1,0 +1,99 @@
+name: CI
+
+# Runs type checking, the production build and the full test suite on every pull
+# request and on pushes to main.
+#
+# The test suite drives a real PostgreSQL server, so the database is provided as
+# an ephemeral service container that is destroyed when the job ends. No
+# repository secret is required and no external database is contacted: a fork's
+# pull request runs exactly the same checks as a branch in this repository.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Read-only by default. The job only needs to read the repository.
+permissions:
+  contents: read
+
+# A newer push supersedes an in-flight run for the same branch.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck, build and test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # Pinned to a major version so an upstream release cannot change results
+        # without a deliberate edit here.
+        image: postgres:16
+        env:
+          POSTGRES_USER: ubp
+          POSTGRES_PASSWORD: ubptest
+          POSTGRES_DB: ubp_test
+        ports:
+          - 5432:5432
+        # The suite connects immediately, so wait until the server accepts
+        # connections rather than racing its startup.
+        options: >-
+          --health-cmd "pg_isready -U ubp -d ubp_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Ephemeral container database. This is not production data and never
+      # leaves the runner.
+      TEST_DATABASE_URL: postgres://ubp:ubptest@127.0.0.1:5432/ubp_test
+      DATABASE_URL: postgres://ubp:ubptest@127.0.0.1:5432/ubp_test
+      # Keeps the suite on a predictable origin when it builds URLs for QR codes.
+      PUBLIC_BASE_URL: https://ubp.test
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        # npm ci installs exactly the lockfile, so a build cannot silently pick
+        # up a newer dependency than the one reviewed.
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Apply migrations
+        # Proves the migration is runnable from an empty database, which is what
+        # a first production deploy does.
+        run: npm run migrate
+
+      - name: Test
+        run: npm test
+
+      - name: Verify the schema rolls back cleanly
+        # A migration that cannot be reversed is a deployment risk, so the
+        # rollback is exercised on every run.
+        run: |
+          PGPASSWORD=ubptest psql -h 127.0.0.1 -U ubp -d ubp_test \
+            -v ON_ERROR_STOP=1 -f db/rollback/0001_phase1_core_down.sql
+          REMAINING=$(PGPASSWORD=ubptest psql -h 127.0.0.1 -U ubp -d ubp_test -tAc \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'schema_migrations'")
+          if [ "$REMAINING" != "0" ]; then
+            echo "Rollback left $REMAINING table(s) behind."
+            exit 1
+          fi
+          echo "Rollback removed every Phase 1 table."
