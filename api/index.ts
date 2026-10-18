@@ -11,7 +11,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { buildRouter, dispatch } from '../server/http/app.ts';
 import { createRequest } from '../server/http/router.ts';
 import { serialiseCookie } from '../server/http/cookies.ts';
-import { loadConfig, ConfigError } from '../server/config.ts';
+import { loadConfig, resolveClientIp, ConfigError } from '../server/config.ts';
 import type { ApiResponse } from '../server/http/router.ts';
 
 const router = buildRouter();
@@ -81,11 +81,10 @@ export default async function handler(
     const url = request.url ?? '/';
     const body = request.method === 'GET' || request.method === 'HEAD' ? undefined : await readBody(request);
 
-    const forwarded = request.headers['x-forwarded-for'];
-    const ip =
-      typeof forwarded === 'string' && forwarded.length > 0
-        ? (forwarded.split(',')[0]?.trim() ?? null)
-        : (request.socket.remoteAddress ?? null);
+    // The client IP comes from a platform-set header only. `X-Forwarded-For` is
+    // appended to, not replaced, by most proxies, so trusting its first entry
+    // would let a caller rotate a fake IP and evade the rate limiter.
+    const ip = resolveClientIp(config, request.headers, request.socket.remoteAddress ?? null);
 
     const apiRequest = createRequest({
       method: request.method ?? 'GET',

@@ -28,14 +28,19 @@ export async function renderQrSvg(payload: string, options: QrRenderOptions = {}
 }
 
 /**
- * Resolves the absolute origin to embed in QR codes and share links.
- * An explicitly configured PUBLIC_BASE_URL wins, so codes printed today keep
- * working after a domain change.
+ * Returns the trusted absolute origin to embed in QR codes, share links and
+ * email links.
+ *
+ * The origin comes from configuration only. An earlier version fell back to the
+ * request's `Host` header, which is attacker-controlled: any caller could make
+ * the API emit links pointing at a domain they chose, and the QR endpoint
+ * caches its response, so a single hostile request could poison a shared cache
+ * with an attacker-origin QR code. `config.publicBaseUrl` is validated at load
+ * time (https on deployed environments, origin only), so there is no request
+ * input in this path at all.
  */
-export function resolvePublicOrigin(config: { publicBaseUrl: string | null }, requestOrigin: string | null): string {
-  if (config.publicBaseUrl) return config.publicBaseUrl;
-  if (requestOrigin) return requestOrigin;
-  return 'http://localhost:5173';
+export function resolvePublicOrigin(config: { publicBaseUrl: string }): string {
+  return config.publicBaseUrl.replace(/\/+$/, '');
 }
 
 /**

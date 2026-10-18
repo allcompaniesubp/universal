@@ -17,6 +17,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { IncomingHttpHeaders } from 'node:http';
+import { CSRF_COOKIE_NAME } from '../server/http/csrf.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -83,8 +84,35 @@ export class TestClient {
     private readonly ip: string = randomTestIp(),
   ) {}
 
-  /** Sends a request through the real router, carrying any cookies set so far. */
-  async request<T = unknown>(
+  /**
+   * Obtains a CSRF token, exactly as the browser does at start-up.
+   *
+   * Called automatically before the first state-changing request so tests
+   * exercise the real double-submit path rather than a bypass.
+   */
+  private async ensureCsrf(): Promise<void> {
+    if (this.cookieJar[CSRF_COOKIE_NAME]) return;
+    const { createRequest } = await import('../server/http/router.ts');
+    const request = createRequest({
+      method: 'GET',
+      url: '/api/auth/csrf',
+      headers: { host: new URL(TEST_ORIGIN).host },
+      body: undefined,
+      ip: this.ip,
+    });
+    const response = await this.router.dispatch(request);
+    for (const cookie of response.cookies ?? []) {
+      if (cookie.name === CSRF_COOKIE_NAME) this.cookieJar[cookie.name] = cookie.value;
+    }
+  }
+
+  /**
+   * Sends a request without the automatic CSRF token or `Origin` header.
+   *
+   * Used only to prove that a request lacking those protections is rejected, so
+   * the tests exercise the guard rather than assume it.
+   */
+  async raw<T = unknown>(
     method: string,
     path: string,
     options: { body?: unknown; headers?: IncomingHttpHeaders; cookies?: Record<string, string> } = {},
@@ -98,7 +126,7 @@ export class TestClient {
       method,
       url: path,
       headers: {
-        host: 'localhost:5173',
+        host: new URL(TEST_ORIGIN).host,
         'content-type': 'application/json',
         ...(cookieHeader ? { cookie: cookieHeader } : {}),
         ...options.headers,
@@ -107,8 +135,51 @@ export class TestClient {
       ip: this.ip,
     });
 
-    const response = await this.router.dispatch(apiRequest);
+    return this.finish<T>(await this.router.dispatch(apiRequest));
+  }
 
+  /** Sends a request through the real router, carrying any cookies set so far. */
+  async request<T = unknown>(
+    method: string,
+    path: string,
+    options: { body?: unknown; headers?: IncomingHttpHeaders; cookies?: Record<string, string> } = {},
+  ): Promise<TestResponse<T>> {
+    const upperMethod = method.toUpperCase();
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(upperMethod)) {
+      await this.ensureCsrf();
+    }
+
+    const cookieHeader = Object.entries({ ...this.cookieJar, ...options.cookies })
+      .map(([name, value]) => `${name}=${encodeURIComponent(value)}`)
+      .join('; ');
+
+    const csrfToken = this.cookieJar[CSRF_COOKIE_NAME];
+
+    const { createRequest } = await import('../server/http/router.ts');
+    const apiRequest = createRequest({
+      method,
+      url: path,
+      headers: {
+        host: new URL(TEST_ORIGIN).host,
+        // A real browser sends Origin on state-changing requests; the server
+        // checks it against PUBLIC_BASE_URL.
+        origin: TEST_ORIGIN,
+        'content-type': 'application/json',
+        ...(cookieHeader ? { cookie: cookieHeader } : {}),
+        ...(csrfToken ? { 'x-csrf-token': csrfToken } : {}),
+        ...options.headers,
+      },
+      body: options.body,
+      ip: this.ip,
+    });
+
+    return this.finish<T>(await this.router.dispatch(apiRequest));
+  }
+
+  /** Stores any cookies the response set, and shapes the result for assertions. */
+  private async finish<T>(
+    response: Awaited<ReturnType<TestClient['router']['dispatch']>>,
+  ): Promise<TestResponse<T>> {
     const setCookie: string[] = [];
     const cookies: Record<string, string> = {};
     for (const cookie of response.cookies ?? []) {
@@ -154,6 +225,8 @@ export class TestClient {
  * Builds the application router with a test configuration.
  * `PUBLIC_BASE_URL` is pinned so QR payload assertions are deterministic.
  */
+export const TEST_ORIGIN = 'https://ubp.test';
+
 export async function buildTestRouter() {
   const { resetConfig, setConfigForTesting } = await import('../server/config.ts');
   const { closePool } = await import('../server/db.ts');
@@ -166,11 +239,15 @@ export async function buildTestRouter() {
     databaseUrl: testDatabaseUrl(),
     nodeEnv: 'test',
     isProduction: false,
-    publicBaseUrl: 'https://ubp.test',
+    isDeployed: true,
+    publicBaseUrl: TEST_ORIGIN,
+    publicBaseUrlExplicit: true,
     sessionCookieName: 'ubp_session',
     sessionTtlDays: 14,
     emailTransport: 'none',
     emailFrom: null,
+    // No trusted edge in tests, so the socket address is authoritative.
+    trustedIpHeader: null,
   });
   resetRateLimits();
 
@@ -236,7 +313,14 @@ export interface RegisteredUser {
   email: string;
   password: string;
   userId: string;
-  /** The verification link token, available because email transport is 'none'. */
+  /**
+   * The raw verification token, read from the database rather than from the API.
+   *
+   * The API deliberately never returns it — that is the point of the fix — so
+   * the suite reaches into the token table the same way an email client would
+   * receive it out of band. This exercises the real verification flow while
+   * asserting that the token is absent from every HTTP response.
+   */
   verificationToken: string | null;
 }
 
@@ -248,10 +332,7 @@ export async function registerUser(
   const email = overrides.email ?? uniqueEmail();
   const password = overrides.password ?? VALID_PASSWORD;
 
-  const response = await client.post<{
-    user: { id: string };
-    emailVerification: { delivered: boolean; verificationUrl?: string };
-  }>('/api/auth/register', {
+  const response = await client.post<{ status: string; message: string }>('/api/auth/register', {
     email,
     password,
     fullName: overrides.fullName ?? 'Test Owner',
@@ -261,14 +342,48 @@ export async function registerUser(
     throw new Error(`Registration failed with status ${response.status}: ${JSON.stringify(response.body)}`);
   }
 
-  let verificationToken: string | null = null;
-  const url = response.body.emailVerification.verificationUrl;
-  if (url) {
-    const match = /token=([^&]+)/.exec(url);
-    verificationToken = match?.[1] ? decodeURIComponent(match[1]) : null;
-  }
+  const userId = await userIdForEmail(email);
+  // The server stores only a hash of the token, and never returns the raw value,
+  // so the suite issues a fresh one the way a real email link would carry it.
+  const verificationToken = await issueVerificationToken(userId);
+  return { email, password, userId, verificationToken };
+}
 
-  return { email, password, userId: response.body.user.id, verificationToken };
+/**
+ * Issues a usable verification token for a user.
+ *
+ * Replaces any pending token, so the returned value is the one the server will
+ * accept. This is the out-of-band delivery an email would perform.
+ */
+export async function issueVerificationToken(userId: string): Promise<string> {
+  const { generateToken, hashToken } = await import('../server/crypto/tokens.ts');
+  const token = generateToken();
+  const client = new Client({ connectionString: testDatabaseUrl() });
+  await client.connect();
+  try {
+    await client.query('DELETE FROM email_verification_tokens WHERE user_id = $1', [userId]);
+    await client.query(
+      `INSERT INTO email_verification_tokens (id, user_id, expires_at)
+       VALUES ($1, $2, now() + interval '24 hours')`,
+      [hashToken(token), userId],
+    );
+  } finally {
+    await client.end();
+  }
+  return token;
+}
+
+async function userIdForEmail(email: string): Promise<string> {
+  const client = new Client({ connectionString: testDatabaseUrl() });
+  await client.connect();
+  try {
+    const result = await client.query<{ id: string }>('SELECT id FROM users WHERE email = $1', [email]);
+    const id = result.rows[0]?.id;
+    if (!id) throw new Error(`No user row found for ${email}.`);
+    return id;
+  } finally {
+    await client.end();
+  }
 }
 
 /** Registers, verifies email, signs in, and creates a business. Returns everything. */

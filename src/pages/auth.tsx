@@ -32,7 +32,7 @@ function AuthShell({
 }
 
 export function RegisterPage() {
-  const { setUser } = useAuth();
+
 
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
@@ -43,7 +43,6 @@ export function RegisterPage() {
   const [verificationNotice, setVerificationNotice] = useState<{
     delivered: boolean;
     message: string;
-    link?: string;
   } | null>(null);
 
   async function handleSubmit(event: FormEvent) {
@@ -54,23 +53,13 @@ export function RegisterPage() {
 
     try {
       const result = await api.register({ email, password, fullName });
-      setUser(result.user);
 
-      if (result.emailVerification.delivered) {
-        setVerificationNotice({
-          delivered: true,
-          message:
-            'Your account has been created. Check your email for the confirmation link to verify your address.',
-        });
-      } else {
-        // Honest state: no email provider is configured, so say so and give the
-        // owner the link directly rather than implying a message was sent.
-        setVerificationNotice({
-          delivered: false,
-          message: result.emailVerification.message,
-          link: result.emailVerification.verificationUrl,
-        });
-      }
+      // Registration does not sign the user in and never returns a verification
+      // link, so there is no session to establish here.
+      setVerificationNotice({
+        delivered: result.status === 'verification_pending',
+        message: result.message,
+      });
     } catch (caught) {
       if (caught instanceof ApiError) {
         setError(caught.message);
@@ -89,30 +78,16 @@ export function RegisterPage() {
         title="Your account is ready"
         subtitle="One more step to confirm your email address."
         footer={
-          <Link to="/dashboard" className="font-medium text-navy-700 hover:text-navy-900">
-            Continue to your dashboard →
+          <Link to="/sign-in" className="font-medium text-navy-700 hover:text-navy-900">
+            Go to sign in →
           </Link>
         }
       >
         <Alert
           tone={verificationNotice.delivered ? 'success' : 'warning'}
-          title={verificationNotice.delivered ? 'Confirmation email sent' : 'Email delivery is not configured'}
+          title={verificationNotice.delivered ? 'Confirmation email sent' : 'Email confirmation is unavailable'}
         >
           <p>{verificationNotice.message}</p>
-          {verificationNotice.link && (
-            <div className="mt-3">
-              <p className="text-xs">
-                Open this link to confirm your address. It is shown here only because this deployment
-                has no email provider configured:
-              </p>
-              <a
-                href={verificationNotice.link}
-                className="mt-1.5 block break-all rounded bg-white/70 px-2 py-1.5 font-mono text-xs text-navy-800 underline"
-              >
-                {verificationNotice.link}
-              </a>
-            </div>
-          )}
         </Alert>
       </AuthShell>
     );
@@ -197,8 +172,8 @@ export function RegisterPage() {
 }
 
 export function SignInPage() {
-  const { setUser } = useAuth();
   const navigate = useNavigate();
+  const { setUser } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);

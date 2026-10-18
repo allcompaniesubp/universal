@@ -3,11 +3,12 @@
  * verification, and password change.
  */
 
-import { getConfig } from '../config.ts';
+import { getConfig, usesSecureCookies } from '../config.ts';
 import { AppError, badRequest, notFound, unauthorized } from '../http/errors.ts';
 import { enforceRateLimit, parseBody, requireUser } from '../http/auth-context.ts';
 import type { ApiResponse, ResponseCookie, Router } from '../http/router.ts';
 import { RATE_LIMITS } from '../http/rate-limit.ts';
+import { CSRF_COOKIE_NAME, createCsrfToken } from '../http/csrf.ts';
 import {
   changePassword,
   consumeEmailVerificationToken,
@@ -35,7 +36,7 @@ function sessionCookie(token: string, expiresAt: Date): ResponseCookie {
     value: token,
     options: {
       httpOnly: true,
-      secure: config.isProduction,
+      secure: usesSecureCookies(config),
       sameSite: 'Lax',
       path: '/',
       expires: expiresAt,
@@ -51,7 +52,7 @@ function clearedCookie(): ResponseCookie {
     value: '',
     options: {
       httpOnly: true,
-      secure: config.isProduction,
+      secure: usesSecureCookies(config),
       sameSite: 'Lax',
       path: '/',
       maxAgeSeconds: 0,
@@ -59,9 +60,37 @@ function clearedCookie(): ResponseCookie {
   };
 }
 
+/**
+ * Issues a fresh CSRF token.
+ *
+ * Readable by script on purpose: the browser must echo it in a header, which is
+ * what makes the double-submit check work. It carries no authority by itself —
+ * it is worthless without the session cookie, and worthless to a cross-site
+ * page, which cannot read it.
+ */
+function csrfCookie(token: string): ResponseCookie {
+  const config = getConfig();
+  return {
+    name: CSRF_COOKIE_NAME,
+    value: token,
+    options: {
+      httpOnly: false,
+      secure: usesSecureCookies(config),
+      sameSite: 'Lax',
+      path: '/',
+      maxAgeSeconds: 60 * 60 * 12,
+    },
+  };
+}
+
 /** Attaches a cookie to a response without disturbing any other header. */
 function withCookie(response: ApiResponse, cookie: ResponseCookie): ApiResponse {
-  return { ...response, cookies: [...(response.cookies ?? []), cookie] };
+  return withCookies(response, [cookie]);
+}
+
+/** Attaches several cookies to a response. */
+function withCookies(response: ApiResponse, cookies: ResponseCookie[]): ApiResponse {
+  return { ...response, cookies: [...(response.cookies ?? []), ...cookies] };
 }
 
 export function registerAuthRoutes(router: Router): void {
@@ -69,33 +98,44 @@ export function registerAuthRoutes(router: Router): void {
     enforceRateLimit(request, 'register', RATE_LIMITS.register);
     const input = parseBody(registerSchema, request.body);
 
-    const { user, verificationToken } = await registerUser(input);
+    const result = await registerUser(input);
 
+    // The response is decided by deployment configuration alone, never by
+    // whether the address already existed. A duplicate therefore produces a
+    // byte-identical body to a fresh registration, so the endpoint cannot be
+    // used to learn which addresses have accounts.
     const config = getConfig();
-    const origin = resolvePublicOrigin(config, request.origin);
-    const verificationUrl = `${origin}/verify-email?token=${encodeURIComponent(verificationToken)}`;
 
-    const delivery = await sendVerificationEmail({
-      to: user.email,
-      fullName: user.full_name,
-      verificationUrl,
-    });
+    if (!config.emailTransport || config.emailTransport === 'none') {
+      return {
+        status: 201,
+        body: {
+          status: 'verification_unavailable',
+          message:
+            'Your account was created, but this deployment has no email provider configured, so no confirmation link could be sent. Email confirmation is unavailable until an email provider is configured. You can still sign in and use your account; your email address will not be shown as confirmed.',
+        },
+      };
+    }
 
-    // Honest reporting: when no transport is configured the API says so and
-    // returns the link to the account owner. It never claims an email was sent.
+    // Email is configured. A token exists only for a genuinely new account; for
+    // a duplicate there is nothing to send, and the caller cannot tell which
+    // case they are in.
+    if (result.outcome === 'created' && result.verificationToken) {
+      const origin = resolvePublicOrigin(config);
+      const verificationUrl = `${origin}/verify-email?token=${encodeURIComponent(result.verificationToken)}`;
+      await sendVerificationEmail({
+        to: result.user.email,
+        fullName: result.user.full_name,
+        verificationUrl,
+      });
+    }
+
     return {
       status: 201,
       body: {
-        user: toPublicUser(user),
-        emailVerification: delivery.delivered
-          ? { delivered: true, transport: delivery.transport }
-          : {
-              delivered: false,
-              reason: 'not_configured',
-              message:
-                'Email delivery is not configured on this deployment, so no verification email was sent. Use the link below to confirm your address.',
-              verificationUrl,
-            },
+        status: 'verification_pending',
+        message:
+          'If that address can receive mail, a confirmation link is on its way. Follow it to finish setting up your account.',
       },
     };
   });
@@ -127,15 +167,36 @@ export function registerAuthRoutes(router: Router): void {
       throw unauthorized('The email address or password is not correct.');
     }
 
-    return withCookie(
+    // The CSRF token is rotated on sign-in so a token observed before
+    // authentication cannot be reused afterwards.
+    return withCookies(
       { status: 200, body: { user: toPublicUser(outcome.user) } },
-      sessionCookie(outcome.token, outcome.expiresAt),
+      [sessionCookie(outcome.token, outcome.expiresAt), csrfCookie(createCsrfToken())],
     );
   });
 
   router.post('/api/auth/logout', async (request) => {
     await destroySession(request.cookies[getConfig().sessionCookieName]);
-    return withCookie({ status: 200, body: { ok: true } }, clearedCookie());
+    // The CSRF cookie is cleared alongside the session so a signed-out browser
+    // does not keep a stale token.
+    return withCookies({ status: 200, body: { ok: true } }, [
+      clearedCookie(),
+      { ...csrfCookie(''), options: { ...csrfCookie('').options, maxAgeSeconds: 0 } },
+    ]);
+  });
+
+  /**
+   * Issues a CSRF token to the browser.
+   *
+   * A GET, so it is not itself CSRF-checked. The SPA calls this once at start-up
+   * and after sign-in. The token is stored in a script-readable cookie and
+   * echoed in the `X-CSRF-Token` header on every state-changing request.
+   */
+  router.get('/api/auth/csrf', async (request) => {
+    enforceRateLimit(request, 'read', RATE_LIMITS.read);
+    const existing = request.cookies[CSRF_COOKIE_NAME];
+    const token = existing && existing.length > 0 ? existing : createCsrfToken();
+    return withCookie({ status: 200, body: { csrfToken: token } }, csrfCookie(token));
   });
 
   router.get('/api/auth/session', async (request) => {

@@ -18,7 +18,7 @@ import {
   type VerificationLevel,
   type VerificationStatus,
 } from '../domain/verification.ts';
-import { conflict, forbidden, notFound, validationFailed } from '../http/errors.ts';
+import { badRequest, conflict, forbidden, notFound, validationFailed } from '../http/errors.ts';
 import type { CreateBusinessInput, UpdateBusinessInput } from '../validation/schemas.ts';
 
 export type BusinessStatus = 'draft' | 'published' | 'unpublished' | 'suspended';
@@ -536,6 +536,25 @@ export async function listPublishedCategories(): Promise<string[]> {
 // ---------------------------------------------------------------------------
 
 /**
+ * Enforces every rule for a business becoming publicly visible.
+ *
+ * Called from both the dedicated publish endpoint and `updateBusiness`, so a
+ * direct `PATCH {"status":"published"}` cannot skip a check that the publish
+ * endpoint applies. Before this existed, the "no empty shell in the directory"
+ * rule and the suspension rule were enforced on only one of the two paths.
+ */
+export function assertCanPublish(row: BusinessRow): void {
+  if (row.status === 'suspended') {
+    throw forbidden('This business has been suspended and cannot be published.');
+  }
+  if (!row.description && !row.tagline) {
+    throw badRequest(
+      'Add a tagline or description before publishing, so visitors see what the business does.',
+    );
+  }
+}
+
+/**
  * Loads a business and asserts that `actorUserId` owns it.
  *
  * This is the single choke point for business authorisation. Every mutating
@@ -615,6 +634,17 @@ export async function updateBusiness(input: {
   if (data.status !== undefined) {
     if (existing.status === 'suspended') {
       throw forbidden('This business has been suspended and cannot be republished from here.');
+    }
+    if (data.status === 'published') {
+      // Rules are evaluated against the values this same request would leave in
+      // place, so supplying a tagline and publishing in one PATCH still works,
+      // while publishing an empty profile through PATCH is refused exactly as
+      // the dedicated publish endpoint refuses it.
+      assertCanPublish({
+        ...existing,
+        tagline: data.tagline !== undefined ? data.tagline : existing.tagline,
+        description: data.description !== undefined ? data.description : existing.description,
+      });
     }
     push('status', data.status);
     if (data.status === 'published') {

@@ -11,7 +11,7 @@
 import express from 'express';
 import { buildRouter, dispatch } from './http/app.ts';
 import { createRequest } from './http/router.ts';
-import { loadConfig } from './config.ts';
+import { loadConfig, resolveClientIp } from './config.ts';
 import { serialiseCookie } from './http/cookies.ts';
 
 const config = loadConfig();
@@ -19,7 +19,11 @@ const app = express();
 const router = buildRouter();
 
 app.disable('x-powered-by');
-app.set('trust proxy', true);
+// `trust proxy` is deliberately off: Express would otherwise believe the
+// client-supplied X-Forwarded-For header and hand back a spoofed address, which
+// is exactly the bypass the rate limiter must not have. There is no trusted
+// proxy in front of the local server, so the socket address is the right answer.
+app.set('trust proxy', false);
 
 app.use(express.json({ limit: '256kb' }));
 
@@ -29,7 +33,7 @@ app.all(/^\/api\/.*/, async (req, res) => {
     url: req.originalUrl,
     headers: req.headers,
     body: req.body,
-    ip: req.ip ?? null,
+    ip: resolveClientIp(config, req.headers, req.socket.remoteAddress ?? null),
   });
 
   const result = await dispatch(router, apiRequest, { isProduction: config.isProduction });

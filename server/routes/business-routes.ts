@@ -10,11 +10,12 @@
  */
 
 import { getConfig } from '../config.ts';
-import { badRequest, forbidden, notFound } from '../http/errors.ts';
+import { badRequest, notFound } from '../http/errors.ts';
 import { enforceRateLimit, optionalUser, parseBody, requireUser } from '../http/auth-context.ts';
-import type { ApiRequest, ApiResponse, Router } from '../http/router.ts';
+import type { ApiResponse, Router } from '../http/router.ts';
 import { RATE_LIMITS } from '../http/rate-limit.ts';
 import {
+  assertCanPublish,
   createBusiness,
   getBusinessById,
   getBusinessBySlug,
@@ -50,8 +51,8 @@ const PUBLICLY_READABLE = new Set(['published']);
  */
 const VERIFICATION_RESOLVABLE = new Set(['published', 'suspended']);
 
-function originFor(request: ApiRequest): string {
-  return resolvePublicOrigin(getConfig(), request.origin);
+function originFor(): string {
+  return resolvePublicOrigin(getConfig());
 }
 
 /**
@@ -60,7 +61,6 @@ function originFor(request: ApiRequest): string {
  * drafts cannot be probed for existence.
  */
 async function loadPubliclyReadable(
-  request: ApiRequest,
   businessId: string,
   viewerUserId: string | null,
 ): Promise<ApiResponse> {
@@ -73,7 +73,7 @@ async function loadPubliclyReadable(
   }
 
   const verification = await loadVerification(row.id);
-  const origin = originFor(request);
+  const origin = originFor();
 
   const body = {
     business: isOwner
@@ -159,7 +159,7 @@ export function registerBusinessRoutes(router: Router): void {
     }
 
     const verification = await loadVerification(row.id);
-    const origin = originFor(request);
+    const origin = originFor();
     return {
       status: 200,
       body: {
@@ -191,7 +191,7 @@ export function registerBusinessRoutes(router: Router): void {
     }
 
     const verification = await loadVerification(row.id);
-    const origin = originFor(request);
+    const origin = originFor();
     const suspended = row.status === 'suspended';
 
     return {
@@ -220,7 +220,7 @@ export function registerBusinessRoutes(router: Router): void {
   router.get('/api/businesses/:id', async (request) => {
     const config = getConfig();
     const viewer = await optionalUser(request, config.sessionCookieName);
-    return loadPubliclyReadable(request, request.params.id ?? '', viewer?.id ?? null);
+    return loadPubliclyReadable(request.params.id ?? '', viewer?.id ?? null);
   });
 
   router.patch('/api/businesses/:id', async (request) => {
@@ -254,8 +254,9 @@ export function registerBusinessRoutes(router: Router): void {
     }
 
     // The QR payload is the public verification URL for the UBP identifier.
-    // It contains no private field and no token.
-    const payload = buildVerificationUrl(originFor(request), row.ubp_id);
+    // It contains no private field and no token, and its origin comes from
+    // validated configuration rather than from the request.
+    const payload = buildVerificationUrl(originFor(), row.ubp_id);
     const svg = await renderQrSvg(payload, { size: 320 });
 
     return {
@@ -263,7 +264,7 @@ export function registerBusinessRoutes(router: Router): void {
       body: svg,
       headers: {
         'Content-Type': 'image/svg+xml; charset=utf-8',
-        'Cache-Control': 'public, max-age=300',
+        'Cache-Control': 'private, max-age=300',
       },
     };
   });
@@ -277,7 +278,7 @@ export function registerBusinessRoutes(router: Router): void {
     const user = await requireUser(request, config.sessionCookieName);
     const row = await requireOwnedBusiness(request.params.id ?? '', user.id);
 
-    const origin = originFor(request);
+    const origin = originFor();
     const websiteUrl = row.website_url ?? buildBusinessUrl(origin, row.slug);
     const vcard = buildVCard({ business: row, websiteUrl });
 
@@ -314,7 +315,7 @@ export function registerBusinessRoutes(router: Router): void {
       throw notFound('No published passport was found with that identifier.');
     }
 
-    const payload = buildVerificationUrl(originFor(request), row.ubp_id);
+    const payload = buildVerificationUrl(originFor(), row.ubp_id);
     const svg = await renderQrSvg(payload, { size: 320 });
 
     return {
@@ -322,6 +323,8 @@ export function registerBusinessRoutes(router: Router): void {
       body: svg,
       headers: {
         'Content-Type': 'image/svg+xml; charset=utf-8',
+        // Public and cacheable: the payload is a function of the UBP identifier
+        // and the configured origin only, so no request input can vary it.
         'Cache-Control': 'public, max-age=300',
       },
     };
@@ -331,9 +334,15 @@ export function registerBusinessRoutes(router: Router): void {
   // Owner: slug suggestion helper
   // -------------------------------------------------------------------------
 
+  /**
+   * Advisory only. Rate limited because it is unauthenticated and reveals
+   * whether a candidate slug is already taken.
+   */
   router.get('/api/businesses/slug-suggestion', async (request) => {
+    enforceRateLimit(request, 'read', RATE_LIMITS.read);
     const name = request.query.get('displayName') ?? '';
     if (name.trim().length < 2) throw badRequest('Provide a business name of at least 2 characters.');
+    if (name.trim().length > 120) throw badRequest('Provide a business name of at most 120 characters.');
     const slug = await suggestAvailableSlug(name);
     return { status: 200, body: { slug } };
   });
@@ -348,16 +357,9 @@ export function registerBusinessRoutes(router: Router): void {
     const user = await requireUser(request, config.sessionCookieName);
     const row = await requireOwnedBusiness(request.params.id ?? '', user.id);
 
-    if (row.status === 'suspended') {
-      throw forbidden('This business has been suspended and cannot be published.');
-    }
-    // A minimum of information is required before a page becomes public, so the
-    // directory never lists an empty shell.
-    if (!row.description && !row.tagline) {
-      throw badRequest(
-        'Add a tagline or description before publishing, so visitors see what the business does.',
-      );
-    }
+    // Publication rules live in one place, shared with PATCH, so the two entry
+    // points cannot drift apart.
+    assertCanPublish(row);
 
     const business = await updateBusiness({
       businessId: row.id,

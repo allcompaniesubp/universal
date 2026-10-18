@@ -14,6 +14,8 @@ import { Router, type ApiRequest, type ApiResponse } from './router.ts';
 import { registerAuthRoutes } from '../routes/auth-routes.ts';
 import { registerBusinessRoutes } from '../routes/business-routes.ts';
 import { registerAdminRoutes } from '../routes/admin-routes.ts';
+import { getConfig } from '../config.ts';
+import { requireCsrf } from './csrf.ts';
 
 export function buildRouter(): Router {
   const router = new Router();
@@ -92,6 +94,10 @@ export async function dispatch(
         body: { error: { code: 'method_not_allowed', message: 'That method is not allowed here.' } },
       };
     } else {
+      // CSRF is enforced centrally, after routing so that an unknown path still
+      // answers 404, but before the handler runs. A route added later is
+      // therefore protected without opting in, and there is no bypass flag.
+      requireCsrf(request, getConfig());
       request.params = matched.params;
       response = await matched.handler(request);
     }

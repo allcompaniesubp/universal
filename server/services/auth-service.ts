@@ -9,7 +9,8 @@ import { query, queryOne, withTransaction } from '../db.ts';
 import { hashPassword, verifyPassword } from '../crypto/password.ts';
 import { generateToken, hashIp, hashToken } from '../crypto/tokens.ts';
 import { getConfig } from '../config.ts';
-import { conflict, unauthorized } from '../http/errors.ts';
+import { emailDeliveryConfigured } from './email-service.ts';
+import { unauthorized } from '../http/errors.ts';
 import { getPool } from '../db.ts';
 
 export type UserRole = 'member' | 'moderator' | 'admin';
@@ -77,39 +78,33 @@ export interface SessionContext {
 // Registration
 // ---------------------------------------------------------------------------
 
-export interface RegisterResult {
-  user: UserRow;
-  verificationToken: string;
-}
+export type RegisterOutcome =
+  | { outcome: 'created'; user: UserRow; verificationToken: string | null }
+  | { outcome: 'duplicate' };
 
 export async function registerUser(input: {
   email: string;
   password: string;
   fullName: string;
-}): Promise<RegisterResult> {
-  const existing = await queryOne<{ id: string }>('SELECT id FROM users WHERE email = $1', [
-    input.email,
-  ]);
-  if (existing) {
-    throw conflict('An account with that email address already exists.', {
-      email: 'An account with that email address already exists.',
-    });
-  }
-
+}): Promise<RegisterOutcome> {
   const passwordHash = await hashPassword(input.password);
 
-  return withTransaction(async (client) => {
+  // Uniqueness is decided by the database, not by a prior SELECT. The unique
+  // index on `email` (with a CHECK constraint guaranteeing lower-case) is the
+  // authority, so two concurrent registrations cannot both succeed.
+  const created = await withTransaction(async (client) => {
     const inserted = await client.query<UserRow>(
       `INSERT INTO users (email, password_hash, full_name)
        VALUES ($1, $2, $3)
+       ON CONFLICT (email) DO NOTHING
        RETURNING *`,
       [input.email, passwordHash, input.fullName],
     );
     const user = inserted.rows[0];
-    if (!user) throw new Error('User insert returned no row.');
+    if (!user) return null;
 
-    // A single-use token is created eagerly. Nothing is verified by creating it:
-    // the email_verified level is only recorded once the token is consumed.
+    // The token is created but nothing is verified by creating it. The
+    // `email_verified` level is only recorded once the token is consumed.
     const token = generateToken();
     await client.query(
       `INSERT INTO email_verification_tokens (id, user_id, expires_at)
@@ -123,8 +118,18 @@ export async function registerUser(input: {
       [user.id, user.id, JSON.stringify({ email: user.email })],
     );
 
-    return { user, verificationToken: token };
+    return { user, token };
   });
+
+  if (!created) return { outcome: 'duplicate' };
+
+  return {
+    outcome: 'created',
+    user: created.user,
+    // A token that cannot be delivered must not be handed to anyone. The caller
+    // sees a pending-verification state instead.
+    verificationToken: emailDeliveryConfigured() ? created.token : null,
+  };
 }
 
 // ---------------------------------------------------------------------------

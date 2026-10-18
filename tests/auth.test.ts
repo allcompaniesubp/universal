@@ -14,6 +14,7 @@ import {
   VALID_PASSWORD,
   type TestClient,
 } from './helpers.ts';
+import { queryOne } from '../server/db.ts';
 
 let client: TestClient;
 
@@ -26,29 +27,48 @@ beforeEach(async () => {
 });
 
 describe('registration', () => {
-  it('creates an account and returns the user without any secret material', async () => {
+  it('creates an account and returns no user object and no secret material', async () => {
     const email = uniqueEmail();
-    const response = await client.post<{ user: Record<string, unknown> }>('/api/auth/register', {
+    const response = await client.post<Record<string, unknown>>('/api/auth/register', {
       email,
       password: VALID_PASSWORD,
       fullName: 'Asha Menon',
     });
 
     expect(response.status).toBe(201);
-    expect(response.body.user.email).toBe(email);
-    expect(response.body.user.emailVerified).toBe(false);
+    expect(response.body.status).toBe('verification_unavailable');
 
-    // The response must never carry the password hash or any token field.
+    // Registration must not leak a user object, a token, or a link.
     const serialised = JSON.stringify(response.body);
     expect(serialised).not.toContain('password_hash');
     expect(serialised).not.toContain('scrypt$');
     expect(serialised).not.toContain(VALID_PASSWORD);
-    expect(response.body.user).not.toHaveProperty('passwordHash');
+    expect(serialised).not.toContain('token=');
+    expect(response.body).not.toHaveProperty('user');
+    expect(response.body).not.toHaveProperty('emailVerification');
+    expect(response.body).not.toHaveProperty('verificationToken');
+    expect(response.body).not.toHaveProperty('verificationUrl');
   });
 
-  it('rejects a duplicate email address', async () => {
+  it('creates the account in an unverified state', async () => {
     const email = uniqueEmail();
-    const first = await client.post('/api/auth/register', {
+    await client.post('/api/auth/register', {
+      email,
+      password: VALID_PASSWORD,
+      fullName: 'Pending Owner',
+    });
+
+    const row = await queryOne<{ email_verified_at: Date | null }>(
+      'SELECT email_verified_at FROM users WHERE email = $1',
+      [email],
+    );
+    // A token exists, but nothing about creating it may count as verification.
+    expect(row?.email_verified_at).toBeNull();
+  });
+
+  it('does not reveal whether an email address is already registered', async () => {
+    const email = uniqueEmail();
+    const first = await client.post<{ status: string; message: string }>('/api/auth/register', {
       email,
       password: VALID_PASSWORD,
       fullName: 'First Owner',
@@ -56,23 +76,33 @@ describe('registration', () => {
     expect(first.status).toBe(201);
 
     const second = await createTestClient();
-    const duplicate = await second.post('/api/auth/register', {
+    const duplicate = await second.post<{ status: string; message: string }>('/api/auth/register', {
       email,
       password: VALID_PASSWORD,
       fullName: 'Second Owner',
     });
-    expect(duplicate.status).toBe(409);
+
+    // Identical status, shape and message as a fresh registration, so the
+    // endpoint cannot be used to enumerate accounts.
+    expect(duplicate.status).toBe(201);
+    expect(duplicate.body.status).toBe(first.body.status);
+    expect(duplicate.body.message).toBe(first.body.message);
+    expect(duplicate.body).not.toHaveProperty('user');
   });
 
   it('normalises the email address to lower case', async () => {
     const email = `MiXeD-${Date.now().toString(36)}@Example.Test`;
-    const response = await client.post<{ user: { email: string } }>('/api/auth/register', {
+    const response = await client.post('/api/auth/register', {
       email,
       password: VALID_PASSWORD,
       fullName: 'Mixed Case',
     });
     expect(response.status).toBe(201);
-    expect(response.body.user.email).toBe(email.toLowerCase());
+
+    const row = await queryOne<{ email: string }>('SELECT email FROM users WHERE email = $1', [
+      email.toLowerCase(),
+    ]);
+    expect(row?.email).toBe(email.toLowerCase());
   });
 
   it('rejects a short password with a field-level error', async () => {
@@ -103,10 +133,8 @@ describe('registration', () => {
     expect(response.status).toBe(422);
   });
 
-  it('states honestly that no email was sent when transport is not configured', async () => {
-    const response = await client.post<{
-      emailVerification: { delivered: boolean; reason?: string; message?: string; verificationUrl?: string };
-    }>('/api/auth/register', {
+  it('states honestly that email confirmation is unavailable when transport is not configured', async () => {
+    const response = await client.post<{ status: string; message: string }>('/api/auth/register', {
       email: uniqueEmail(),
       password: VALID_PASSWORD,
       fullName: 'Honest Reporting',
@@ -114,10 +142,10 @@ describe('registration', () => {
 
     expect(response.status).toBe(201);
     // The suite runs with EMAIL_TRANSPORT=none, so the API must say so rather
-    // than implying a message was delivered.
-    expect(response.body.emailVerification.delivered).toBe(false);
-    expect(response.body.emailVerification.reason).toBe('not_configured');
-    expect(response.body.emailVerification.message).toMatch(/no verification email was sent/i);
+    // than implying a message was delivered, and must not hand out a link.
+    expect(response.body.status).toBe('verification_unavailable');
+    expect(response.body.message).toMatch(/no email provider configured/i);
+    expect(JSON.stringify(response.body)).not.toContain('token=');
   });
 });
 

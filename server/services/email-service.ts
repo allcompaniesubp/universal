@@ -6,10 +6,11 @@
  * allowance, a paid plan. Rather than silently pretending a message was sent,
  * the transport reports honestly:
  *
- *   EMAIL_TRANSPORT=none    -> nothing is sent. The API tells the caller that
- *                              delivery is not configured and returns the
- *                              verification link to the signed-in owner only,
- *                              so a single-operator deployment stays testable.
+ *   EMAIL_TRANSPORT=none    -> nothing is sent. The registration endpoint tells
+ *                              the caller that confirmation is unavailable, and
+ *                              no verification link is returned to anyone. The
+ *                              account stays unverified until a provider is
+ *                              configured and the owner completes the flow.
  *   EMAIL_TRANSPORT=console -> the link is written to the server log. Intended
  *                              for local development only.
  *

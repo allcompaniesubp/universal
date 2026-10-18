@@ -36,7 +36,46 @@ function extractFields(details: unknown): Record<string, string> {
   return out;
 }
 
+const CSRF_COOKIE_NAME = 'ubp_csrf';
+const CSRF_HEADER_NAME = 'X-CSRF-Token';
+
+function readCookie(name: string): string | null {
+  const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+  return match?.[1] ? decodeURIComponent(match[1]) : null;
+}
+
+/** Cached in memory so a state-changing request does not need an extra round trip. */
+let csrfToken: string | null = null;
+
+/**
+ * Fetches a CSRF token if one is not already held.
+ *
+ * The server checks this value against a cookie it set, so a cross-site page —
+ * which can send the cookie but cannot read it — cannot produce a valid request.
+ */
+export async function ensureCsrfToken(): Promise<string> {
+  if (csrfToken) return csrfToken;
+  const fromCookie = readCookie(CSRF_COOKIE_NAME);
+  if (fromCookie) {
+    csrfToken = fromCookie;
+    return fromCookie;
+  }
+  const response = await fetch('/api/auth/csrf', { credentials: 'include' });
+  const body = (await response.json().catch(() => null)) as { csrfToken?: string } | null;
+  csrfToken = body?.csrfToken ?? readCookie(CSRF_COOKIE_NAME);
+  if (!csrfToken) throw new Error('Could not obtain a CSRF token.');
+  return csrfToken;
+}
+
+/** Called after sign-in and sign-out, when the server rotates the token. */
+export function resetCsrfToken(): void {
+  csrfToken = null;
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const method = (init.method ?? 'GET').toUpperCase();
+  const mutating = !['GET', 'HEAD', 'OPTIONS'].includes(method);
+
   let response: Response;
   try {
     response = await fetch(path, {
@@ -44,6 +83,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       credentials: 'include',
       headers: {
         ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(mutating ? { [CSRF_HEADER_NAME]: await ensureCsrfToken() } : {}),
         ...init.headers,
       },
     });
@@ -178,15 +218,15 @@ export interface DirectoryResponse {
 }
 
 export interface RegisterResponse {
-  user: PublicUser;
-  emailVerification:
-    | { delivered: true; transport: string }
-    | {
-        delivered: false;
-        reason: string;
-        message: string;
-        verificationUrl: string;
-      };
+  /**
+   * `verification_pending` when a confirmation link was sent or would be sent;
+   * `verification_unavailable` when this deployment has no email provider.
+   *
+   * Neither value is ever accompanied by a verification token: only the mailbox
+   * can complete verification.
+   */
+  status: 'verification_pending' | 'verification_unavailable';
+  message: string;
 }
 
 export interface ConfigStatus {
