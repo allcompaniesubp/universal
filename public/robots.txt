@@ -1,0 +1,14 @@
+# Robots policy for the Universal Business Passport.
+#
+# Private areas are disallowed so that a dashboard, editor or API response is
+# never indexed, and so that a crawler cannot follow a session-scoped URL.
+
+User-agent: *
+Allow: /
+
+Disallow: /dashboard
+Disallow: /businesses/
+Disallow: /api/
+Disallow: /verify-email
+
+Sitemap: https://allcompanies.unspuniversity.com/sitemap.xml
